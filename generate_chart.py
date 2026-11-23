@@ -18,11 +18,11 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/csv,text/plain,*/*",
+    "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# None 代表完整下載羅素 2000 全部約 1,980 檔；雲端全自動執行無須手動等待
+# None 代表完整下載羅素 2000 全部成分股
 RUSSELL_MAX_STOCKS = None
 
 FALLBACK_SOX = [
@@ -32,76 +32,101 @@ FALLBACK_SOX = [
 ]
 
 
-def fetch_ishares_etf_tickers(csv_url, max_count=None, retries=3):
-    """從 iShares 官方 CSV 動態定位 Ticker 欄位，含自動重試機制"""
-    last_err = None
-    for attempt in range(retries):
-        try:
-            res = requests.get(csv_url, headers=HEADERS, timeout=20)
-            res.raise_for_status()
-            lines = res.text.splitlines()
-            start_idx = next(
-                i for i, line in enumerate(lines) if line.startswith("Ticker,")
-            )
-            df = pd.read_csv(io.StringIO("\n".join(lines[start_idx:])))
+def parse_ishares_csv_text(text, max_count=None):
+    """解析 iShares CSV 內容，支援 BOM、引號表頭並防範 HTML 阻擋頁"""
+    head_sample = text[:1000].lower()
+    if "<html" in head_sample or "<!doctype" in head_sample:
+        raise ValueError("回傳內容為 HTML 網頁而非 CSV（iShares 可能阻擋了雲端 IP）")
 
-            if "Asset Class" in df.columns:
-                df = df[df["Asset Class"] == "Equity"]
+    lines = text.splitlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        cleaned_line = line.lstrip("\ufeff").strip()
+        if cleaned_line.startswith("Ticker,") or cleaned_line.startswith('"Ticker",'):
+            start_idx = i
+            break
 
-            raw_tickers = df["Ticker"].dropna().astype(str).str.strip().tolist()
-            ticker_map = {
-                "BRKB": "BRK-B", "BFB": "BF-B", "CRDA": "CRD-A", "CRDB": "CRD-B",
-                "BIOB": "BIO-B", "HEIA": "HEI-A", "LENB": "LEN-B", "MOGA": "MOG-A",
-            }
+    if start_idx is None:
+        raise ValueError("無法在 CSV 中找到 Ticker 表頭列")
 
-            cleaned = []
-            for t in raw_tickers:
-                if t in ("-", "USD", "IWM", "IVV", "SOXX") or len(t) > 6:
-                    continue
-                t_clean = ticker_map.get(t, t.replace(".", "-").replace(" ", "-"))
-                if all(c.isalnum() or c == "-" for c in t_clean):
-                    cleaned.append(t_clean)
+    df = pd.read_csv(io.StringIO("\n".join(lines[start_idx:])), on_bad_lines="skip")
+    df.columns = [str(c).strip() for c in df.columns]
 
-            cleaned = list(dict.fromkeys(cleaned))
-            return cleaned[:max_count] if max_count else cleaned
-        except Exception as err:
-            last_err = err
-            time.sleep(2 * (attempt + 1))
-    raise last_err
+    if "Asset Class" in df.columns:
+        df = df[df["Asset Class"].astype(str).str.strip().str.lower() == "equity"]
+
+    raw_tickers = df["Ticker"].dropna().astype(str).str.strip().tolist()
+    ticker_map = {
+        "BRKB": "BRK-B", "BFB": "BF-B", "CRDA": "CRD-A", "CRDB": "CRD-B",
+        "BIOB": "BIO-B", "HEIA": "HEI-A", "LENB": "LEN-B", "MOGA": "MOG-A",
+    }
+
+    cleaned = []
+    for t in raw_tickers:
+        if t in ("-", "USD", "IWM", "IVV", "SOXX", "XTSLA") or len(t) > 6:
+            continue
+        t_clean = ticker_map.get(t, t.replace(".", "-").replace(" ", "-"))
+        if all(c.isalnum() or c == "-" for c in t_clean):
+            cleaned.append(t_clean)
+
+    cleaned = list(dict.fromkeys(cleaned))
+    return cleaned[:max_count] if max_count else cleaned
+
+
+def fetch_ishares_etf_tickers(csv_url, max_count=None):
+    """從 iShares 線上抓取 CSV（快速失敗機制，避免浪費等待時間）"""
+    res = requests.get(csv_url, headers=HEADERS, timeout=15)
+    res.raise_for_status()
+    text = res.content.decode("utf-8-sig", errors="replace")
+    return parse_ishares_csv_text(text, max_count=max_count)
 
 
 def get_all_constituents():
     print("1. 正在獲取三大指數成分股清單...")
 
-    # S&P 500 (iShares IVV + GitHub CSV 備援)
+    # (1) S&P 500 (iShares IVV -> GitHub 開源 CSV 備援)
     try:
         ivv_url = "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund"
         sp500 = fetch_ishares_etf_tickers(ivv_url, max_count=503)
         if len(sp500) < 400:
             raise ValueError("IVV 成分股數量異常")
-        print(f" - S&P 500: 成功從 iShares 取得 ({len(sp500)} 檔)")
+        print(f" - S&P 500: 成功從 iShares 線上取得 ({len(sp500)} 檔)")
     except Exception:
         sp500_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
         sp500 = pd.read_csv(sp500_url)["Symbol"].str.replace(".", "-", regex=False).tolist()
         print(f" - S&P 500: 已透過開源 CSV 備援取得 ({len(sp500)} 檔)")
 
-    # Russell 2000 (iShares IWM)
-    iwm_url = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
-    r2000 = fetch_ishares_etf_tickers(iwm_url, max_count=RUSSELL_MAX_STOCKS)
-    if len(r2000) < 500:
-        raise RuntimeError(f"Russell 2000 成分股抓取異常，僅取得 {len(r2000)} 檔")
-    print(f" - Russell 2000: 成功從 iShares 取得 ({len(r2000)} 檔)")
+    # (2) Russell 2000 (iShares IWM -> 專案內本地 IWM_holdings.csv 備援)
+    try:
+        iwm_url = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+        r2000 = fetch_ishares_etf_tickers(iwm_url, max_count=RUSSELL_MAX_STOCKS)
+        if len(r2000) < 500:
+            raise ValueError("IWM 成分股數量異常")
+        print(f" - Russell 2000: 成功從 iShares 線上取得 ({len(r2000)} 檔)")
+    except Exception as err:
+        local_iwm = next(
+            (f for f in os.listdir(".") if f.lower().endswith(".csv") and "iwm" in f.lower()),
+            None,
+        )
+        if not local_iwm:
+            raise RuntimeError(
+                f"無法從 iShares 線上抓取 Russell 2000 ({err})，且專案內找不到本地 IWM_holdings.csv 檔案。"
+                "請用瀏覽器下載 IWM_holdings.csv 並上傳至 GitHub 專案根目錄。"
+            )
+        with open(local_iwm, "r", encoding="utf-8-sig", errors="replace") as f:
+            r2000 = parse_ishares_csv_text(f.read(), max_count=RUSSELL_MAX_STOCKS)
+        print(f" - Russell 2000: iShares 線上受限，已改用專案內 {local_iwm} 取得 ({len(r2000)} 檔)")
 
-    # SOX 費半 (iShares SOXX + 內建備援)
+    # (3) SOX 費半 (iShares SOXX -> 內建清單備援)
     try:
         soxx_url = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf/1467271812596.ajax?fileType=csv&fileName=SOXX_holdings&dataType=fund"
         sox = fetch_ishares_etf_tickers(soxx_url, max_count=30)
         if len(sox) < 25:
             raise ValueError("SOXX 成分股數量異常")
-        print(f" - SOX 費半: 成功從 iShares 取得 ({len(sox)} 檔)")
+        print(f" - SOX 費半: 成功從 iShares 線上取得 ({len(sox)} 檔)")
     except Exception:
         sox = FALLBACK_SOX
-        print(f" - SOX 費半: 已切換內建清單 ({len(sox)} 檔)")
+        print(f" - SOX 費半: 已切換內建清單備援 ({len(sox)} 檔)")
 
     return sp500, r2000, sox
 
@@ -140,14 +165,13 @@ def calc_breadth(tickers, name, batch_size=350):
 
         close_df.index = pd.to_datetime(close_df.index).tz_localize(None)
         all_close.append(close_df)
-        time.sleep(1)  # 稍微放慢批次間隔，降低被 Yahoo 限流的機率
+        time.sleep(1)
 
     if not all_close:
         raise RuntimeError(f"{name} 下載資料為空")
 
     data = pd.concat(all_close, axis=1)
     data = data.loc[:, ~data.columns.duplicated()].dropna(axis=1, how="all")
-    # 過濾非美股正常交易日的零星報價
     data = data[data.notna().sum(axis=1) > (len(tickers) * 0.5)]
 
     ma20 = data.rolling(window=20, min_periods=20).mean()
@@ -158,7 +182,6 @@ def calc_breadth(tickers, name, batch_size=350):
     pct_50 = ((data > ma50).sum(axis=1) / ma50.notna().sum(axis=1)) * 100
     pct_200 = ((data > ma200).sum(axis=1) / ma200.notna().sum(axis=1)) * 100
 
-    # 取近一年 (約 252 個交易日)
     idx = pct_20.dropna().tail(252).index
     valid_latest = int(data.loc[idx[-1]].notna().sum())
 
@@ -169,6 +192,11 @@ def calc_breadth(tickers, name, batch_size=350):
         valid_latest,
         len(tickers),
     )
+
+
+def fmt_pct(series):
+    val = series.iloc[-1]
+    return f"{val:.1f}%" if pd.notna(val) else "N/A"
 
 
 def main():
@@ -193,8 +221,8 @@ def main():
     subplot_titles = []
     for name, (p20, p50, p200, valid_n, total_n), _ in datasets:
         subplot_titles.append(
-            f"<b>{name}</b> ｜ 20MA: {p20.iloc[-1]:.1f}% ・ 50MA: {p50.iloc[-1]:.1f}% "
-            f"・ 200MA: {p200.iloc[-1]:.1f}% "
+            f"<b>{name}</b> ｜ 20MA: {fmt_pct(p20)} ・ 50MA: {fmt_pct(p50)} "
+            f"・ 200MA: {fmt_pct(p200)} "
             f"<span style='font-size:12px;color:#64748b;'>(有效樣本: {valid_n}/{total_n})</span>"
         )
 
@@ -210,7 +238,6 @@ def main():
     for i, (name, (p20, p50, p200, _, _), idx_close) in enumerate(datasets, start=1):
         aligned_idx = idx_close.reindex(p20.index).ffill()
 
-        # 背景指數收盤價 (右軸)
         fig.add_trace(
             go.Scatter(
                 x=aligned_idx.index,
@@ -226,7 +253,6 @@ def main():
             secondary_y=True,
         )
 
-        # 20MA / 50MA / 200MA 市場寬度 (左軸)
         fig.add_trace(
             go.Scatter(
                 x=p20.index,
@@ -270,7 +296,6 @@ def main():
             secondary_y=False,
         )
 
-        # 80% / 50% / 20% 情緒輔助線
         fig.add_hline(y=80, line_dash="dash", line_color="#ef4444", opacity=0.45, row=i, col=1)
         fig.add_hline(y=50, line_dash="solid", line_color="#94a3b8", opacity=0.4, row=i, col=1)
         fig.add_hline(y=20, line_dash="dash", line_color="#22c55e", opacity=0.45, row=i, col=1)
@@ -314,7 +339,6 @@ def main():
         legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="right", x=1),
     )
 
-    # 輸出成手機與電腦皆適用的獨立 HTML 網頁
     os.makedirs("public", exist_ok=True)
     chart_html = fig.to_html(
         full_html=False, include_plotlyjs="cdn", config={"responsive": True}
