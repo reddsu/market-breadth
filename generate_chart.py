@@ -1,4 +1,3 @@
-import io
 import os
 import time
 import warnings
@@ -18,11 +17,9 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
 }
 
-# None 代表完整下載羅素 2000 全部成分股
+# None 代表完整下載羅素 2000 全部成分股（約 1,970 檔）
 RUSSELL_MAX_STOCKS = None
 
 FALLBACK_SOX = [
@@ -32,98 +29,60 @@ FALLBACK_SOX = [
 ]
 
 
-def parse_ishares_csv_text(text, max_count=None):
-    """解析 iShares CSV 內容，支援 BOM、引號表頭並防範 HTML 阻擋頁"""
-    head_sample = text[:1000].lower()
-    if "<html" in head_sample or "<!doctype" in head_sample:
-        raise ValueError("回傳內容為 HTML 網頁而非 CSV（iShares 可能阻擋了雲端 IP）")
+def fetch_plain_tickers(url, max_count=None):
+    """從 GitHub 純文字檔（每行一檔代號）讀取並清洗為 Yahoo Finance 格式"""
+    res = requests.get(url, headers=HEADERS, timeout=20)
+    res.raise_for_status()
+    text = res.text
 
-    lines = text.splitlines()
-    start_idx = None
-    for i, line in enumerate(lines):
-        cleaned_line = line.lstrip("\ufeff").strip()
-        if cleaned_line.startswith("Ticker,") or cleaned_line.startswith('"Ticker",'):
-            start_idx = i
-            break
+    if "<html" in text[:500].lower() or "<!doctype" in text[:500].lower():
+        raise ValueError("回傳內容為 HTML 網頁而非純文字代號清單")
 
-    if start_idx is None:
-        raise ValueError("無法在 CSV 中找到 Ticker 表頭列")
-
-    df = pd.read_csv(io.StringIO("\n".join(lines[start_idx:])), on_bad_lines="skip")
-    df.columns = [str(c).strip() for c in df.columns]
-
-    if "Asset Class" in df.columns:
-        df = df[df["Asset Class"].astype(str).str.strip().str.lower() == "equity"]
-
-    raw_tickers = df["Ticker"].dropna().astype(str).str.strip().tolist()
     ticker_map = {
         "BRKB": "BRK-B", "BFB": "BF-B", "CRDA": "CRD-A", "CRDB": "CRD-B",
         "BIOB": "BIO-B", "HEIA": "HEI-A", "LENB": "LEN-B", "MOGA": "MOG-A",
     }
 
     cleaned = []
-    for t in raw_tickers:
-        if t in ("-", "USD", "IWM", "IVV", "SOXX", "XTSLA") or len(t) > 6:
+    for line in text.splitlines():
+        t = line.strip().upper()
+        if not t or t.startswith("#") or t in ("-", "USD", "IWM", "IVV", "SPY", "SOXX", "XTSLA"):
             continue
         t_clean = ticker_map.get(t, t.replace(".", "-").replace(" ", "-"))
-        if all(c.isalnum() or c == "-" for c in t_clean):
+        if len(t_clean) <= 6 and all(c.isalnum() or c == "-" for c in t_clean):
             cleaned.append(t_clean)
 
     cleaned = list(dict.fromkeys(cleaned))
     return cleaned[:max_count] if max_count else cleaned
 
 
-def fetch_ishares_etf_tickers(csv_url, max_count=None):
-    """從 iShares 線上抓取 CSV（快速失敗機制，避免浪費等待時間）"""
-    res = requests.get(csv_url, headers=HEADERS, timeout=15)
-    res.raise_for_status()
-    text = res.content.decode("utf-8-sig", errors="replace")
-    return parse_ishares_csv_text(text, max_count=max_count)
-
-
 def get_all_constituents():
-    print("1. 正在獲取三大指數成分股清單...")
+    print("1. 正在從 GitHub 開源資料集獲取三大指數成分股清單...")
+    base_url = "https://raw.githubusercontent.com/major/index-etfs/main/tickers"
 
-    # (1) S&P 500 (iShares IVV -> GitHub 開源 CSV 備援)
+    # (1) S&P 500
     try:
-        ivv_url = "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund"
-        sp500 = fetch_ishares_etf_tickers(ivv_url, max_count=503)
+        sp500 = fetch_plain_tickers(f"{base_url}/spy.txt")
         if len(sp500) < 400:
-            raise ValueError("IVV 成分股數量異常")
-        print(f" - S&P 500: 成功從 iShares 線上取得 ({len(sp500)} 檔)")
+            raise ValueError("SPY 清單數量異常")
+        print(f" - S&P 500: 成功取得 ({len(sp500)} 檔)")
     except Exception:
         sp500_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
         sp500 = pd.read_csv(sp500_url)["Symbol"].str.replace(".", "-", regex=False).tolist()
         print(f" - S&P 500: 已透過開源 CSV 備援取得 ({len(sp500)} 檔)")
 
-    # (2) Russell 2000 (iShares IWM -> 專案內本地 IWM_holdings.csv 備援)
-    try:
-        iwm_url = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
-        r2000 = fetch_ishares_etf_tickers(iwm_url, max_count=RUSSELL_MAX_STOCKS)
-        if len(r2000) < 500:
-            raise ValueError("IWM 成分股數量異常")
-        print(f" - Russell 2000: 成功從 iShares 線上取得 ({len(r2000)} 檔)")
-    except Exception as err:
-        local_iwm = next(
-            (f for f in os.listdir(".") if f.lower().endswith(".csv") and "iwm" in f.lower()),
-            None,
-        )
-        if not local_iwm:
-            raise RuntimeError(
-                f"無法從 iShares 線上抓取 Russell 2000 ({err})，且專案內找不到本地 IWM_holdings.csv 檔案。"
-                "請用瀏覽器下載 IWM_holdings.csv 並上傳至 GitHub 專案根目錄。"
-            )
-        with open(local_iwm, "r", encoding="utf-8-sig", errors="replace") as f:
-            r2000 = parse_ishares_csv_text(f.read(), max_count=RUSSELL_MAX_STOCKS)
-        print(f" - Russell 2000: iShares 線上受限，已改用專案內 {local_iwm} 取得 ({len(r2000)} 檔)")
+    # (2) Russell 2000
+    r2000 = fetch_plain_tickers(f"{base_url}/iwm.txt", max_count=RUSSELL_MAX_STOCKS)
+    if len(r2000) < 500:
+        raise RuntimeError(f"Russell 2000 清單數量異常，僅取得 {len(r2000)} 檔")
+    print(f" - Russell 2000: 成功取得 ({len(r2000)} 檔)")
 
-    # (3) SOX 費半 (iShares SOXX -> 內建清單備援)
+    # (3) SOX 費半
     try:
-        soxx_url = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf/1467271812596.ajax?fileType=csv&fileName=SOXX_holdings&dataType=fund"
-        sox = fetch_ishares_etf_tickers(soxx_url, max_count=30)
+        sox = fetch_plain_tickers(f"{base_url}/soxx.txt")
         if len(sox) < 25:
-            raise ValueError("SOXX 成分股數量異常")
-        print(f" - SOX 費半: 成功從 iShares 線上取得 ({len(sox)} 檔)")
+            raise ValueError("SOXX 清單數量異常")
+        print(f" - SOX 費半: 成功取得 ({len(sox)} 檔)")
     except Exception:
         sox = FALLBACK_SOX
         print(f" - SOX 費半: 已切換內建清單備援 ({len(sox)} 檔)")
@@ -131,14 +90,20 @@ def get_all_constituents():
     return sp500, r2000, sox
 
 
-def fetch_index_close(symbol):
-    """抓取大盤指數本身收盤價，用於雙 Y 軸背離對照"""
-    raw = yf.download(symbol, period="2y", auto_adjust=True, progress=False)
-    close = raw["Close"]
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-    close.index = pd.to_datetime(close.index).tz_localize(None)
-    return close.dropna()
+def fetch_index_close(primary_symbol, fallback_symbol):
+    """抓取大盤指數收盤價作為背景對照，若指數代號失敗自動退回對應 ETF"""
+    for sym in (primary_symbol, fallback_symbol):
+        raw = yf.download(sym, period="2y", auto_adjust=True, progress=False)
+        if raw.empty:
+            continue
+        close = raw["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close.index = pd.to_datetime(close.index).tz_localize(None)
+        close = close.dropna()
+        if not close.empty:
+            return close
+    raise RuntimeError(f"無法取得指數收盤價: {primary_symbol} / {fallback_symbol}")
 
 
 def calc_breadth(tickers, name, batch_size=350):
@@ -172,7 +137,8 @@ def calc_breadth(tickers, name, batch_size=350):
 
     data = pd.concat(all_close, axis=1)
     data = data.loc[:, ~data.columns.duplicated()].dropna(axis=1, how="all")
-    data = data[data.notna().sum(axis=1) > (len(tickers) * 0.5)]
+    # 過濾非美股正常交易日的零星報價
+    data = data[data.notna().sum(axis=1) > (data.shape[1] * 0.5)]
 
     ma20 = data.rolling(window=20, min_periods=20).mean()
     ma50 = data.rolling(window=50, min_periods=50).mean()
@@ -208,9 +174,9 @@ def main():
     sox_res = calc_breadth(sox_tickers, "SOX 費半")
 
     print(" - 正在下載三大指數收盤價作為背景對照...")
-    sp500_idx = fetch_index_close("^GSPC")
-    r2000_idx = fetch_index_close("^RUT")
-    sox_idx = fetch_index_close("^SOX")
+    sp500_idx = fetch_index_close("^GSPC", "SPY")
+    r2000_idx = fetch_index_close("^RUT", "IWM")
+    sox_idx = fetch_index_close("^SOX", "SOXX")
 
     datasets = [
         ("S&P 500", sp500_res, sp500_idx),
